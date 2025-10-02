@@ -100,7 +100,7 @@ if st.button("Fetch Teams"):
 teams = st.session_state.get("teams", [])
 
 # Tabs
-tab_leader, tab_player = st.tabs(["🏆 Leaderboard", "📈 Game Log"])
+tab_leader, tab_player, tab_fantasy = st.tabs(["🏆 Leaderboard", "📈 Game Log", "🎯 Fantasy"])
 
 # ------- helper: normalize various API response shapes into list-of-rows -------
 def normalize_rows(payload):
@@ -321,3 +321,97 @@ with tab_player:
                     st.caption("Snap% not available yet for this range (data source has not published it).")
 
                 st.dataframe(df[ordered_cols], use_container_width=True)
+
+# -------------------------
+# Fantasy tab
+# -------------------------
+with tab_fantasy:
+    st.header("Fantasy Insights")
+
+    # Controls
+    colA, colB, colC = st.columns(3)
+    f_season = colA.number_input("Season", value=2025, step=1, key="fantasy_season")
+    f_week   = colB.number_input("Week", value=1, step=1, min_value=1, max_value=22, key="fantasy_week")
+
+    # Team dropdown from cached teams (optional)
+    team_names = [""] + [t.get("team") for t in teams] if teams else [""]
+    f_team = colC.selectbox("Team (optional)", options=team_names, index=0, key="fantasy_team")
+
+    f_player_q = st.text_input("Player (name or id fragment, optional)", value="", key="fantasy_player_q")
+    flimit = st.slider("Max rows", 10, 500, 200, step=10, key="fantasy_limit")
+
+    if st.button("Fetch Fantasy", key="fantasy_fetch"):
+        params = {
+            "season": f_season,
+            "week": f_week,
+            "team": f_team or None,
+            "q": (f_player_q.strip() or None),
+            "limit": flimit,
+            "offset": 0,
+        }
+        params = {k: v for k, v in params.items() if v not in ("", None)}
+
+        # Show the exact call we’ll make
+        st.caption(
+            f"→ GET {st.session_state['API_BASE']}/fantasy-insights {params} "
+            f"| x-api-key set: {'yes' if st.session_state['API_TOKEN'] else 'no'}"
+        )
+
+        # Call primary endpoint; if 404 fallback to /fantasy
+        try:
+            payload = api_get("/fantasy-insights", params=params)
+        except Exception as e:
+            # If backend returns a 404 shaped error, try alternate route name
+            try:
+                payload = api_get("/fantasy", params=params)
+                st.info("Fell back to /fantasy endpoint.")
+            except Exception:
+                raise  # preserve original streamlit error flow
+
+        # Normalize to list-of-rows
+        rows = normalize_rows(payload)
+        if not rows:
+            st.warning("No rows parsed from API response. If the raw JSON above looks correct, tell me its shape so I can add a case.")
+        else:
+            df = pd.DataFrame(rows)
+
+            # Try to surface a unified fantasy_points column if the table uses different names
+            fp_candidates = ["fantasy_points_ppr", "fantasy_points", "ppr_points", "points"]
+            if "fantasy_points" not in df.columns:
+                for c in fp_candidates:
+                    if c in df.columns:
+                        df["fantasy_points"] = pd.to_numeric(df[c], errors="coerce")
+                        break
+
+            # Coerce common numeric fields (won’t error if missing)
+            for col in [
+                "season","week",
+                "fantasy_points",
+                "targets","receptions","receiving_yards","receiving_tds",
+                "carries","rushing_yards","rushing_tds",
+                "passing_yards","passing_tds","interceptions",
+                "fumbles_lost","two_point_conversions",
+            ]:
+                if col in df.columns:
+                    df[col] = pd.to_numeric(df[col], errors="coerce")
+
+            # Preferred order – we’ll include what exists and then append any extras
+            preferred = [
+                "season","week",
+                "player_display_name","position","recent_team","opponent_team",
+                "fantasy_points",
+                "targets","receptions","receiving_yards","receiving_tds","air_yards",
+                "carries","rushing_yards","rushing_tds",
+                "passing_yards","passing_tds","interceptions",
+                "fumbles_lost","two_point_conversions",
+                "player_id",
+            ]
+            ordered_cols = [c for c in preferred if c in df.columns]
+            ordered_cols += [c for c in df.columns if c not in ordered_cols]
+
+            st.success(f"Loaded {len(df)} rows; columns: {list(df.columns)}")
+            with st.expander("Raw API result", expanded=False):
+                st.write(type(payload))
+                st.json(payload)
+
+            st.dataframe(df[ordered_cols], use_container_width=True)
