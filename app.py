@@ -39,6 +39,23 @@ def api_get(path: str, params=None, *, base=None, token=None, timeout=20):
         st.error(f"API unreachable: {e}\nTried: {url}")
         st.stop()
 
+def _resolve_player_id(query: str | None) -> str | None:
+    """Best-effort resolver: try ID-like input first, else /players search -> first result."""
+    if not query:
+        return None
+    q = query.strip()
+    # If it looks like an ID, accept as-is
+    if "-" in q and len(q) >= 6:
+        return q
+    # Otherwise search
+    try:
+        matches = api_get("/players", params={"q": q, "limit": 1}) or []
+        if matches:
+            return matches[0].get("player_id")
+    except Exception:
+        pass
+    return None
+
 # ---- UI ----
 st.title("NFL Viz Dashboard")
 
@@ -174,17 +191,17 @@ with tab_leader:
                 st.dataframe(df, use_container_width=True)
 
 # -------------------------
-# Game Log tab (ready-to-paste)
+# Game Log tab (fixed & instrumented)
 # -------------------------
 with tab_player:
     st.header("Player Game Log")
 
-    # One unified search bar (name or id) + optional picker
+    # Unified search input
     colL, colR = st.columns([3,1])
     user_query = colL.text_input("Player (name or id)", value=st.session_state.get("find_player_query", ""), key="find_player_query")
     search_clicked = colR.button("Search", key="player_search_btn")
 
-    # Helper to format options cleanly
+    # Label helper
     def _label_from_row(m: dict) -> str:
         pid  = m.get("player_id") or "?"
         name = (m.get("player_display_name") or m.get("full_name")
@@ -193,24 +210,20 @@ with tab_player:
         pos  = m.get("position") or m.get("pos") or "--"
         return f"{name} · {team} · {pos} · {pid}"
 
-    # If user hit Search, query /players once and persist results
+    # Search flow
     if search_clicked and user_query.strip():
         try:
             st.session_state["player_search_results"] = api_get("/players", params={"q": user_query.strip(), "limit": 25}) or []
         except Exception:
             st.session_state["player_search_results"] = []
-
-        # If exactly one match, auto-select it
         if len(st.session_state["player_search_results"]) == 1:
             only = st.session_state["player_search_results"][0]
             st.session_state["selected_player_id"] = only.get("player_id")
 
     results = st.session_state.get("player_search_results", [])
 
-    # If we have results, show a sticky picker; otherwise allow direct-ID usage
     if results:
         labels = [_label_from_row(m) for m in results]
-        # remember last choice
         default_idx = st.session_state.get("player_choice_idx", 0)
         idx = st.selectbox(
             "Select player",
@@ -222,40 +235,63 @@ with tab_player:
         st.session_state["selected_player_id"] = results[idx].get("player_id")
         st.caption(f"Selected: {labels[idx]}")
     else:
-        # If user typed a full-looking id (e.g., 00-0031381), accept it directly
+        # allow direct id in the search box
         if user_query and "-" in user_query and len(user_query) >= 6:
             st.session_state["selected_player_id"] = user_query.strip()
 
-    # ---- Window & controls
+    # Window controls
     col1, col2, col3, col4 = st.columns(4)
     g_season_from = col1.number_input("Season From", value=2025, step=1, key="game_season_from")
     g_season_to   = col2.number_input("Season To",   value=2025, step=1, key="game_season_to")
     g_week_from   = col3.number_input("Week From",   value=1,    step=1, min_value=1, key="game_week_from")
     g_week_to     = col4.number_input("Week To",     value=17,   step=1, min_value=1, max_value=22, key="game_week_to")
-    glimit = st.slider("Max rows", 10, 500, 200, step=10, key="game_limit")
+    # raise the cap so pagination never hides a single week
+    glimit = st.slider("Max rows", 10, 2000, 500, step=10, key="game_limit")
 
-
-    # --- Main action button ---
     if st.button("Fetch Game Log", key="game_go"):
-        # Priority: chosen via picker → text box → error
-        pid = st.session_state.get("selected_player_id") or _resolve_player_id(q)
+        pid = st.session_state.get("selected_player_id") or _resolve_player_id(user_query)
         if not pid:
-            st.warning("Enter a player name/id or use 'Find Player' to select one.")
+            st.warning("Enter a player name/id or use 'Search' to select one.")
         else:
             params = {
                 "season_from": g_season_from, "season_to": g_season_to,
                 "week_from": g_week_from, "week_to": g_week_to,
                 "limit": glimit, "offset": 0
             }
-            rows = api_get(f"/game-log/enriched/{pid}", params=params)
-            df = pd.DataFrame(rows)
+
+            # Show the exact request (makes it easy to reproduce with curl)
+            st.caption(
+                f"→ GET {st.session_state['API_BASE']}/game-log/enriched/{pid} {params} "
+                f"| x-api-key set: {'yes' if st.session_state['API_TOKEN'] else 'no'}"
+            )
+
+            payload = api_get(f"/game-log/enriched/{pid}", params=params)
+
+            # ✅ Normalize any {"data":[...]} / {"rows":[...]} shapes
+            rows = normalize_rows(payload)
+            if not rows and isinstance(payload, list):
+                rows = payload  # already list-of-dicts
+
+            df = pd.DataFrame(rows or [])
+            with st.expander("🔎 Debug payload", expanded=False):
+                st.write("Raw type:", type(payload))
+                st.json(payload if isinstance(payload, dict) else (payload[:5] if isinstance(payload, list) else payload))
 
             if df.empty:
                 st.warning("No rows for this window.")
             else:
-                # Sort + clean
+                # Ensure ints for filters/sorting
+                for _c in ("season","week"):
+                    if _c in df.columns:
+                        df[_c] = pd.to_numeric(df[_c], errors="coerce").astype("Int64")
+
+                # Quick visibility check before any downstream transforms
+                pre_weeks = sorted([int(x) for x in df["week"].dropna().unique().tolist()]) if "week" in df.columns else []
+                st.caption(f"Weeks present (pre-display): {pre_weeks}")
+
+                # Sort
                 if {"season","week"}.issubset(df.columns):
-                    df = df.sort_values(["season","week"])
+                    df = df.sort_values(["season","week","player_display_name"], kind="stable")
 
                 # Title
                 title = df.get("player_display_name")
@@ -272,53 +308,14 @@ with tab_player:
                     if col in df.columns:
                         df[col] = pd.to_numeric(df[col], errors="coerce")
 
-                # Preferred column order: puts longest plays next to their families
                 preferred = [
-                    # Context
-                    "season",                 # (int; no commas)
-                    "week",
-                    "player_display_name",
-                    "position",
-                    "recent_team",
-                    "opponent_team",
-
-                    # Receiving
-                    "targets",
-                    "receptions",
-                    "receiving_yards",
-                    "receiving_tds",
-                    "air_yards",
-                    "long_rec",
-
-                    # Rushing
-                    "carries",
-                    "rushing_yards",
-                    "rushing_tds",
-                    "long_rush",
-
-                    # Passing
-                    "passing_yards",
-                    "passing_tds",
-                    "interceptions",
-
-                    # Misc
-                    "fumbles_lost",
-                    "two_point_conversions",
-                    "player_id",
-                ] 
-
-                # Ensure numeric season/week (so they render as plain integers)
-                for _c in ("season", "week"):
-                    if _c in df.columns:
-                        df[_c] = pd.to_numeric(df[_c], errors="coerce").astype("Int64")
-
-                # Build final order: requested columns that exist, then any extras at the end
-                ordered_cols = [c for c in preferred if c in df.columns]
-                ordered_cols += [c for c in df.columns if c not in ordered_cols]
-
-                # Snap% hint if missing
-                if "snap_pct" not in df.columns or df["snap_pct"].isna().all():
-                    st.caption("Snap% not available yet for this range (data source has not published it).")
+                    "season","week","player_display_name","position","recent_team","opponent_team",
+                    "targets","receptions","receiving_yards","receiving_tds","air_yards","long_rec",
+                    "carries","rushing_yards","rushing_tds","long_rush",
+                    "passing_yards","passing_tds","interceptions",
+                    "fumbles_lost","two_point_conversions","player_id",
+                ]
+                ordered_cols = [c for c in preferred if c in df.columns] + [c for c in df.columns if c not in preferred]
 
                 st.dataframe(df[ordered_cols], use_container_width=True)
 
@@ -326,92 +323,74 @@ with tab_player:
 # Fantasy tab
 # -------------------------
 with tab_fantasy:
-    st.header("Fantasy Insights")
+    st.header("Fantasy")
 
-    # Controls
-    colA, colB, colC = st.columns(3)
+    # Filters
+    colA, colB, colC, colD = st.columns([1,1,1,2])
     f_season = colA.number_input("Season", value=2025, step=1, key="fantasy_season")
-    f_week   = colB.number_input("Week", value=1, step=1, min_value=1, max_value=22, key="fantasy_week")
+    f_week   = colB.number_input("Week",   value=1,    step=1, min_value=1, max_value=22, key="fantasy_week")
 
-    # Team dropdown from cached teams (optional)
-    team_names = [""] + [t.get("team") for t in teams] if teams else [""]
-    f_team = colC.selectbox("Team (optional)", options=team_names, index=0, key="fantasy_team")
+    # Team dropdown (optional)
+    team_options = [""] + [t.get("team") for t in teams] if teams else [""]
+    f_team = colC.selectbox("Team (optional)", team_options, index=0, key="fantasy_team")
 
-    f_player_q = st.text_input("Player (name or id fragment, optional)", value="", key="fantasy_player_q")
-    flimit = st.slider("Max rows", 10, 500, 200, step=10, key="fantasy_limit")
+    # Player search by NAME (fragment). This goes to backend as ?q=
+    f_query = colD.text_input("Player (name fragment)", value="", key="fantasy_q")
 
-    if st.button("Fetch Fantasy", key="fantasy_fetch"):
-        params = {
-            "season": f_season,
-            "week": f_week,
-            "team": f_team or None,
-            "q": (f_player_q.strip() or None),
-            "limit": flimit,
-            "offset": 0,
-        }
-        params = {k: v for k, v in params.items() if v not in ("", None)}
+    f_limit = st.slider("Max rows", 10, 500, 100, step=10, key="fantasy_limit")
 
-        # Show the exact call we’ll make
-        st.caption(
-            f"→ GET {st.session_state['API_BASE']}/fantasy-insights {params} "
-            f"| x-api-key set: {'yes' if st.session_state['API_TOKEN'] else 'no'}"
-        )
+    if st.button("Fetch Fantasy", key="fantasy_go"):
+        with st.spinner("Loading fantasy insights..."):
+            params = {
+                "season": int(f_season),
+                "week": int(f_week),
+                "limit": int(f_limit),
+                "offset": 0,
+            }
+            if f_team:
+                params["team"] = f_team
+            if f_query.strip():
+                params["q"] = f_query.strip()
 
-        # Call primary endpoint; if 404 fallback to /fantasy
-        try:
+            # Show the exact call for debugging
+            st.caption(f"→ GET {st.session_state['API_BASE']}/fantasy-insights {params}")
+
             payload = api_get("/fantasy-insights", params=params)
-        except Exception as e:
-            # If backend returns a 404 shaped error, try alternate route name
-            try:
-                payload = api_get("/fantasy", params=params)
-                st.info("Fell back to /fantasy endpoint.")
-            except Exception:
-                raise  # preserve original streamlit error flow
+            rows = normalize_rows(payload)
 
-        # Normalize to list-of-rows
-        rows = normalize_rows(payload)
-        if not rows:
-            st.warning("No rows parsed from API response. If the raw JSON above looks correct, tell me its shape so I can add a case.")
-        else:
-            df = pd.DataFrame(rows)
+            if not rows:
+                st.warning("No rows returned for these filters.")
+            else:
+                df = pd.DataFrame(rows)
 
-            # Try to surface a unified fantasy_points column if the table uses different names
-            fp_candidates = ["fantasy_points_ppr", "fantasy_points", "ppr_points", "points"]
-            if "fantasy_points" not in df.columns:
-                for c in fp_candidates:
+                # Make sure key numeric fields show as numbers
+                numeric_cols = [
+                    "fantasy_points", "targets", "carries",
+                    "receiving_yards", "receiving_tds",
+                    "rushing_yards", "rushing_tds",
+                    "snap_pct", "offense_snap_pct",
+                    "rz_touches", "hv_touches",
+                    "target_share", "rush_share",
+                    "target_share_delta3", "rush_share_delta3",
+                ]
+                for c in numeric_cols:
                     if c in df.columns:
-                        df["fantasy_points"] = pd.to_numeric(df[c], errors="coerce")
-                        break
+                        df[c] = pd.to_numeric(df[c], errors="coerce")
 
-            # Coerce common numeric fields (won’t error if missing)
-            for col in [
-                "season","week",
-                "fantasy_points",
-                "targets","receptions","receiving_yards","receiving_tds",
-                "carries","rushing_yards","rushing_tds",
-                "passing_yards","passing_tds","interceptions",
-                "fumbles_lost","two_point_conversions",
-            ]:
-                if col in df.columns:
-                    df[col] = pd.to_numeric(df[col], errors="coerce")
+                # Preferred column order — includes player_id visibly
+                preferred = [
+                    "season","week",
+                    "player_display_name","player_id","position",
+                    "recent_team","opponent_team",
+                    "fantasy_points",
+                    "targets","receptions","receiving_yards","receiving_tds","air_yards",
+                    "carries","rushing_yards","rushing_tds",
+                    "snap_pct","offense_snap_pct",
+                    "rz_touches","hv_touches",
+                    "target_share","rush_share",
+                    "usage_delta","note","role_change_flag",
+                ]
+                ordered = [c for c in preferred if c in df.columns] + [c for c in df.columns if c not in preferred]
 
-            # Preferred order – we’ll include what exists and then append any extras
-            preferred = [
-                "season","week",
-                "player_display_name","position","recent_team","opponent_team",
-                "fantasy_points",
-                "targets","receptions","receiving_yards","receiving_tds","air_yards",
-                "carries","rushing_yards","rushing_tds",
-                "passing_yards","passing_tds","interceptions",
-                "fumbles_lost","two_point_conversions",
-                "player_id",
-            ]
-            ordered_cols = [c for c in preferred if c in df.columns]
-            ordered_cols += [c for c in df.columns if c not in ordered_cols]
-
-            st.success(f"Loaded {len(df)} rows; columns: {list(df.columns)}")
-            with st.expander("Raw API result", expanded=False):
-                st.write(type(payload))
-                st.json(payload)
-
-            st.dataframe(df[ordered_cols], use_container_width=True)
+                st.success(f"{len(df)} rows")
+                st.dataframe(df[ordered], use_container_width=True)

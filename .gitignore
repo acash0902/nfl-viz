@@ -1,36 +1,3 @@
-# Python
+.venv/
 __pycache__/
 *.pyc
-*.pyo
-*.pyd
-*.db
-*.sqlite
-instance/
-.env
-.venv/
-.env.*.local
-
-# data / artifacts
-data/
-*.parquet
-*.csv
-*.gz
-
-# Node/JS (for the viz app or any frontend assets)
-node_modules/
-dist/
-build/
-
-# OS/editor
-.DS_Store
-.vscode/
-.idea/
-
-# Logs
-*.log
-
-# pyproject/poetry caches
-.poetry/
-
-# Streamlit caches
-.streamlit/
